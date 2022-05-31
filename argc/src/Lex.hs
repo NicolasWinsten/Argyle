@@ -78,9 +78,13 @@ eatOperator :: Consumer
 eatOperator input = eatInfixIdent input `orElse` eatOp input
     where
         isOperatorSymbol = (`elem` validOperatorSymbols)
-        eatOp = eat (all isOperatorSymbol) (not . isOperatorSymbol) Toperator
+        eatOp = eat (all isOperatorSymbol) (not . isOperatorSymbol) opType
         orElse x y = if isNothing x then y else x
+        opType s = if last s == ':' then Troperator s else Toperator s
 
+-- eat a reserved non-alpha symbol like (, ), ->, =>, =, ;
+-- some of the symbols have to be eaten eagerly.
+-- For example, "(,)" parses out as '(' ',' ')' but =>> will parse as '=>>'
 eatReservedSymbol :: Consumer
 eatReservedSymbol = msum . ([eatEager, eatOtherReservedSymbol] <*>) . pure
     where

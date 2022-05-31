@@ -6,6 +6,7 @@ import qualified Data.Set as Set
 data TokenClass
     = Tident String     -- identifier
     | Toperator String  -- infix operator
+    | Troperator String -- right associative infix operator
     | Tkeyword String   -- class, instance, view, alias, data
     | Tpipe         -- |
     | Tcolon        -- :
