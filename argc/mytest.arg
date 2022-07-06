@@ -1,4 +1,6 @@
 
 
-
-mempty : Maybe a
+some = do
+  this
+  then this
+  return ()

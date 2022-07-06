@@ -47,15 +47,15 @@ import Token
 
 prog    : body {reverse $1}
 
-body    : prog decl {$2 : $1} | decl {[$1]}
+body    : body decl {$2 : $1} | decl {[$1]}
 
 indentedBody : INDENT body DEDENT {reverse $2} | {- empty -} {[]}
 
 decl    : def {$1} | typesig {$1} | instance {$1} | class {$1} | data {$1}
 
-def     : VAR exprlist '=' rhs  { Def $1 (foldr Lambda $4 $2) }
+def     : VAR exprlist '=' rhs  { Def $1 (foldr lambda $4 $2) }
         | VAR '=' rhs  { Def $1 $3 }
-        | single OP single '=' rhs { Def $2 $ Lambda $1 (Lambda $3 $5) }
+        | single OP single '=' rhs { Def $2 $ lambda $1 (lambda $3 $5) }
 
 rhs     : expr NEWLINE {$1} | NEWLINE INDENT expr NEWLINE DEDENT {$3}
 
@@ -66,7 +66,10 @@ expr   : lambda    { $1 }
 
 lambda : singlelambda {$1}
 
-singlelambda : rightoper '=>' expr {Lambda $1 $3} | rightoper { $1 }
+maybeLambda : exprlist lamrhs
+lamrhs  : '=>' expr {$2} | {- empty -} {}
+
+singlelambda : exprlist '=>' expr {Lambda [($1, $3)]}
 
 -- right-associative operations
 rightoper: oper OPR rightoper {App (App (Ident $2) $1) $3} | oper {$1}
@@ -154,7 +157,7 @@ parseError :: [TokenClass] -> a
 parseError toks = error $ "Parse Error:" ++ show toks
 
 data Expr
-    = Lambda Expr Expr
+    = Lambda [([Expr], Expr)]
     | App Expr Expr
     | Ident String
     | LiteralInt Int
@@ -163,6 +166,9 @@ data Expr
     | LiteralChar Char
     | UnderScore
     deriving Show
+
+lambda :: Expr -> Expr -> Expr
+lambda l r = Lambda [([l], r)]
 
 data Constraint = Constraint String [String] deriving (Show, Eq)
 
@@ -207,15 +213,6 @@ ty2constraint (TyCon a tys)
     | all isSimple tys = Constraint a (map kindName tys)
     | otherwise = error $ "Your type constraints are funky"
 
-expr2type :: Expr -> Type
-expr2type ex = case expr2typeAux ex of
-    Ty a -> Ty a
-    TyCon a args -> TyCon a (reverse args)
-    where
-        expr2typeAux (Ident a) = Ty a
-        expr2typeAux (App (Ident a) ex) = TyCon a [expr2type ex]
-        expr2typeAux (App a@(App _ _) ex2) = let (TyCon name args) = expr2type a in TyCon name (expr2type ex2 : args)
-        expr2typeAux _ = error $ "Types do not support literals or lambdas"
 
 
 

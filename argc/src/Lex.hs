@@ -1,210 +1,258 @@
-{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeFamilies #-}
+
 
 module Lex(lexer) where
 
+import ParseT
+
 import Token
 import Data.Char
-import Data.List
+import Data.List as List hiding (singleton)
 import Data.Maybe
 import Control.Monad
+import Control.Applicative(Alternative((<|>), many, some))
 import qualified Data.Map as Map
 import Data.Tuple
+
+(|||) :: (a -> Bool) -> (a -> Bool) -> a -> Bool
+(|||) p q x = p x || q x
 
 isSpaceOrTab :: Char -> Bool
 isSpaceOrTab = flip elem [' ', '\t']
 
-lastIndexOf :: Eq a => a -> [a] -> Maybe Int
-lastIndexOf _ [] = Nothing
-lastIndexOf x xs = helper x xs 0 where
-    helper y (z:zs) idx
-        | y == z = Just idx
-        | otherwise = helper y zs (idx + 1)
-    helper _ [] _ = Nothing
+singleton = (: [])
 
--- count the remaining elements in the list after the last occurrence of x
-elemsAfter :: Eq a => a -> [a] -> Int
-elemsAfter x xs
-    | Just idx <- lastIndexOf x xs = length xs - 1 - idx
-    | otherwise = 0
+data LexingState = LexState {
+    charStream :: String, position :: Location, countingIndent :: Bool, indentChar :: Char, indentStack :: [Int]
+} deriving Show
 
--- current input state means part of the input yet to be consumed and the current location
-type InputState = (String, Location)
+-- lexer will parse from a string while tracking location in the string
+-- plus a flag that indicates if we should be counting indentation
+-- (for after we've seen a newline and until we see a nonwhitespace character, we're counting indentation)
+type Lexer a = ParseT LexingState a
 
--- consumers will attempt to consume a token from the input
-type Consumer = InputState -> Maybe (Token, InputState)
+instance ParseState LexingState where
+    type El LexingState = Char
+    getNext LexState{charStream=[]} = Nothing
+    -- only update Location, the indent stack is handled by the indent/dedent parsers
+    getNext (LexState (c:cs) pos countingIndent indentChar indentStack)
+        = Just $ (,) c $ case c of
+        '\n' -> LexState cs (incLine . resetCol . resetIndent $ pos) True indentChar indentStack
+        c
+            | countingIndent, c == badIndentChar -> error $ "You're mixing indentation first at line " ++ show (line pos)
+            | countingIndent, c == indentChar -> LexState cs (incIndent . incCol $ pos) True indentChar indentStack
+            | otherwise -> LexState cs (incCol pos) False indentChar indentStack
+        where
+            badIndentChar
+              | indentChar == ' ' = '\t'
+              | indentChar == '\t' = ' '
+              | otherwise = error "Why are you indenting like a maniac?"
 
-{-
-eat p q will produce a consumer that will read chars until q is true
-and check that the consumed string satisfies p
--}
-eat :: (String -> Bool) -> (Char -> Bool) -> (String -> TokenClass) -> Consumer
-eat p q tokClass = consume where
-    consume :: Consumer
-    consume (charStream, pos@Loc{line=line, col=col})
-        | (word, rest) <- break q charStream
-        , (not . null) word
-        , p word
-        , numNewlines <- length . filter (=='\n') $ word
-        , newCol <- if numNewlines == 0 then col + length word else elemsAfter '\n' word
-        = Just (Token (tokClass word) pos, (rest, pos{line = line + numNewlines, col = newCol}))
-        | otherwise = Nothing
+getPosition :: Lexer Location
+getPosition = fmap position getState
 
--- consume something from the input and discard it
-chompThis :: String -> InputState -> Maybe InputState
-chompThis thing (charStream, pos@Loc{line=line, col=col}) = do
-    rest <- stripPrefix thing charStream
-    let numNewlines = length . filter (== '\n') $ thing
-    let newCol = if numNewlines == 0 then col + length thing else elemsAfter '\n' thing
-    Just(rest, Loc{line=line+numNewlines, col=newCol})
+lineNumber :: Lexer Int
+lineNumber = fmap (line . position) getState
 
-eatKeyword :: Consumer
-eatKeyword = eat (`elem` keywords) isSpace Tkeyword
+-- grab the size of the last indent
+lastIndent :: Lexer Int
+lastIndent = do
+    stack <- fmap indentStack getState
+    return $ fromMaybe 0 $ listToMaybe stack
 
-eatIdentifier :: Consumer
-eatIdentifier = eat isValidIdent (not. isAlphaNum) Tident
-    where
-        isValidIdent (c:cs) = isAlpha c && all isAlphaNum cs
-        isValidIdent _ = False
+-- NOTE: test for an emptyline before running this operation
+updateIndentStack :: Lexer [TokenClass]
+updateIndentStack = do
+    ind <- eatWhitespace
+    lastInd <- lastIndent
+    currentStack <- indentStack <$> getState
+    if ind > lastInd then do
+        modifyState (\state -> state{indentStack= ind : currentStack})
+        return [Tindent]
+    else if ind == lastInd then
+        return []
+    else do
+        modifyState (\state -> state{indentStack= dropWhile (> ind) currentStack})
+        ind' <- lastIndent
+        pos <- getPosition
+        errorIf (ind' /= ind) "Orphaned indentation"
+        let numDangling = length . takeWhile (> ind) $ currentStack
+        return $ replicate numDangling Tdedent
 
--- scan `infixFunc`
-eatInfixIdent :: Consumer
-eatInfixIdent input = do
-    chomped <- chompThis "`" input
-    (token@Token{tokenClass=Tident ident}, chompedIdent) <- eatIdentifier chomped
-    finalInput <- chompThis "`" chompedIdent
-    Just (token{tokenClass=Toperator ident}, finalInput)
 
-eatOperator :: Consumer
-eatOperator input = eatInfixIdent input `orElse` eatOp input
-    where
-        isOperatorSymbol = (`elem` validOperatorSymbols)
-        eatOp = eat (all isOperatorSymbol) (not . isOperatorSymbol) opType
-        orElse x y = if isNothing x then y else x
-        opType s = if last s == ':' then Troperator s else Toperator s
+emptyline :: Lexer ()
+emptyline = do
+    eatWhitespace
+    newline >> pure () <|> end
+    return ()
+
+word :: Lexer String
+word = do
+    w <- chompWhile (not . isSpace)
+    guard (not . null $ w)
+    return w
+
+keyword :: Lexer TokenClass
+keyword = do
+    w <- word
+    guard (w `elem` keywords)
+    return $ Tkeyword w
+
+isValidIdent (c:cs) = isAlpha c && all (isAlphaNum ||| (`elem` "\'_")) cs
+isValidIdent _ = False
+
+identifier :: Lexer TokenClass
+identifier = do
+    w <- word
+    guard (w `notElem` keywords)
+    guard $ isValidIdent w
+    return $ Tvar w
+
+backtick = single '\''
+
+infixIdentifier :: Lexer TokenClass
+infixIdentifier = do
+    backtick
+    Tvar w <- identifier
+    backtick
+    return $ Toperator w
+
+operator :: Lexer TokenClass
+operator = do
+    opName <- chompWhile (`elem` validOperatorSymbols)
+    guard (not . null $ opName)
+    guard $ not $ opName `Map.member` reservedSymbols
+    return $ if last opName == ':' then Troperator opName else Toperator opName
+
 
 -- eat a reserved non-alpha symbol like (, ), ->, =>, =, ;
 -- some of the symbols have to be eaten eagerly.
 -- For example, "(,)" parses out as '(' ',' ')' but =>> will parse as '=>>'
-eatReservedSymbol :: Consumer
-eatReservedSymbol = msum . ([eatEager, eatOtherReservedSymbol] <*>) . pure
+reservedSymbol :: Lexer TokenClass
+reservedSymbol = fmap (reservedSymbols Map.!) (eagerSymbol <|> otherReservedSymbol)
     where
-        symbols = mconcat $ Map.keys reservedSymbols
-        eagerSymbols = filter (not . (`elem` validOperatorSymbols)) symbols
+        symbols = concat $ Map.keys reservedSymbols
+        eagerSymbol :: Lexer String
+        eagerSymbol =
+            fmap singleton . oneOf .
+                map single $ filter (`notElem` validOperatorSymbols) symbols
 
-        -- consume these tokens eagerly: ( ) { } [ ] ; , _
-        eatEager (sym : rest, pos) | sym `elem` eagerSymbols =
-            Just(Token (reservedSymbols Map.! [sym]) pos, (rest, pos{col=col pos + 1}))
-        eatEager _ = Nothing
+        otherReservedSymbol :: Lexer String
+        otherReservedSymbol = do
+            sym <- oneOf $ map ParseT.seq $ Map.keys reservedSymbols
+            guard (sym `Map.member` reservedSymbols)
+            return sym
 
-        eatOtherReservedSymbol =
-            eat (`Map.member` reservedSymbols) (\c -> isSpace c || isAlphaNum c) (reservedSymbols Map.!)
+underscore :: Lexer TokenClass
+underscore = do
+    some $ single '_'
+    c <- peek
+    guard (not . isAlpha $ c)
+    return Tunderscore
 
-eatIntLiteral :: Consumer
-eatIntLiteral = eat (all isDigit) (not . isDigit) (TintLiteral . read)
+int :: Lexer TokenClass
+int = do
+    num <- chompWhile isDigit
+    guard (not . null $ num)
+    return $ TintLiteral . read $ num
 
-eatFloatLiteral :: Consumer
-eatFloatLiteral input = do
-    (leftOfDecimal@Token{tokenClass=TintLiteral whole}, state1) <- eatIntLiteral input
-    state2 <- chompThis "." state1
-    (Token{tokenClass=TintLiteral decimal}, finalState) <- eatIntLiteral state2
-    let floatVal = show whole ++ "." ++ show decimal
-    Just(leftOfDecimal{tokenClass=TfloatLiteral $ read floatVal}, finalState)
+float :: Lexer TokenClass
+float = do
+    TintLiteral whole <- int
+    single '.'
+    TintLiteral decimal <- int
+    let num = show whole ++ "." ++ show decimal
+    return $ TfloatLiteral . read $ num
 
-eatCharLiteral :: Consumer
-eatCharLiteral input = do
-    chompedApost <- chompThis "'" input
-    (charToken, chompedChar) <- eat ((== 1) . length) (== '\'') (TcharLiteral . head) chompedApost
-    finalState <- chompThis "'" chompedChar
-    Just(charToken, finalState)
+-- TODO handle escaped characters!
+char :: Lexer TokenClass
+char = do
+    single '\''
+    c <- next
+    single '\''
+    return $ TcharLiteral c
 
-eatStringLiteral :: Consumer
-eatStringLiteral input = do
-    chompedQuote <- chompThis "\"" input
-    (str, chompedStr) <- eat (const True) (== '\"') TstringLiteral chompedQuote
-    finalState <- chompThis "\"" chompedStr
-    Just(str, finalState)
+string :: Lexer TokenClass
+string = do
+    single '\"'
+    str <- chompWhile (/= '"')
+    single '\"'
+    return $ TstringLiteral str
 
-eatNewline :: Consumer
-eatNewline input@(_, location) = do
-    newState <- chompThis "\n" input
-    Just(Token Tnewline location, newState)
+newline :: Lexer TokenClass
+newline = single '\n' >> pure Tnewline
 
-consumers :: [Consumer]
-consumers =
-    [ eatKeyword
-    , eatIdentifier
-    , eatReservedSymbol
-    , eatOperator
-    , eatIntLiteral
-    , eatFloatLiteral
-    , eatCharLiteral
-    , eatStringLiteral
-    , eatNewline
+eatWhitespace :: Lexer Int
+eatWhitespace = length <$> chompWhile (`elem` "\t ")
+
+token :: Lexer TokenClass
+token = oneOf $ fmap (<* eatWhitespace)
+    [ keyword
+    , identifier
+    , float
+    , int
+    , char
+    , string
+    , operator
+    , reservedSymbol
+    , underscore
+    , infixIdentifier
     ]
 
-{- 
-Consume the next token, returns token and remaining input
--}
-next :: Consumer
-next (dropWhile isSpaceOrTab -> input, location) = msum $ consumers <*> pure (input, location)
+-- parse a tokenclass and mark where it is in the source
+enrichWithLocation :: Lexer TokenClass -> Lexer Token
+enrichWithLocation p = do
+    pos <- getPosition
+    tok <- p
+    return $ Token tok pos
+
 
 lexer :: String -> [Token]
-lexer input = theTokens where
+lexer input = result where
     -- determine if user is using tabs or spaces for indentation
     firstChars = mapMaybe listToMaybe $ lines input
     indentChar = fromMaybe '\t' $ find isSpaceOrTab firstChars
-    badIndentChar = if indentChar == '\t' then ' ' else '\t'
 
-    -- return the leading number of indents of the given string
-    chompTabs :: String -> (String, Int)
-    chompTabs s
-        | (next : _) <- rest, next == badIndentChar
-        -- = error . show $ (leading, rest)
-        = error $ "You're mixing indentation at :::" ++ take 50 rest ++ "::: Choose either tabs or spaces."
-        | otherwise = (rest, length leading)
-        where
-            (leading, rest) = span (== indentChar) s
+    initState = LexState
+        input
+        Loc{line=1, col=0, indentation=0}
+        False
+        indentChar
+        []
+
+    -- any indentation tokens
+    indentation' :: Lexer [Token]
+    indentation' = do
+        pos <- getPosition
+        map (`Token` pos) <$> updateIndentStack
+
+    -- content tokens
+    content :: Lexer [Token]
+    content = many $ enrichWithLocation token
+
+    -- a newline possibly followed by emptylines
+    newline' :: Lexer [Token]
+    newline' = singleton <$> enrichWithLocation (newline <* many emptyline)
+
+    
+    scan :: Lexer [Token]
+    scan = do
+        toks1 <- indentation'
+        toks2 <- content
+        maybeMore <- try newline'
+        case maybeMore of
+            Just toks3 -> do
+                more <- scan
+                return $ toks1 ++ toks2 ++ toks3 ++ more
+            Nothing -> do
+                pos <- getPosition
+                cleanup <- indentation' -- close out dangling indentation blocks
+                let maybeNewline = [Token Tnewline pos | not (null cleanup)]
+                return $ toks1 ++ toks2 ++ maybeNewline ++ cleanup
 
 
-    -- lex on syntactically significant whitespace, skip past empty lines
-    eatIndentations :: [Int] -> InputState -> ([Token], InputState, [Int])
-    eatIndentations pastIndents (charStream, pos@Loc{line=line, col=col})
-        -- empty line, ignore it
-        | ('\n':skip) <- rest
-        = eatIndentations pastIndents (skip, Loc{line=line+1, col=0})
-        -- we have indented more, so report indent token
-        | indent > head pastIndents
-        = ([Token Tindent pos], newState, indent : pastIndents)
-        -- this line has misaligned indentation
-        | indent /= head newIndentStack
-        = error $ "Orphaned indentation at :::" ++ take 15 rest ++ ":::"
-        | otherwise
-        -- take all past indents that are greater than this one off the stack and report tokens
-        -- to close the indentation block
-        = (replicate numDedents $ Token Tdedent pos, newState, newIndentStack)
-        where
-            (rest, indent) = chompTabs charStream
-            numDedents = length $ takeWhile (> indent) pastIndents
-            newState = (rest, pos{col=col+indent})
-            newIndentStack = drop numDedents pastIndents
-
-    scan :: [Int] -> InputState -> [Token]
-    scan danglingIndents ("", pos) =
-        Token Tnewline pos : replicate (length danglingIndents - 1) (Token Tdedent pos)
-    scan indents inputState@(str, _)
-        | Just (nextToken, nextState) <- next inputState
-        = if tokenClass nextToken == Tnewline
-            then nextToken : beginline indents nextState
-            else nextToken : scan indents nextState
-        | otherwise
-        = error $ "Lexing error at :::" ++ take 15 str ++ ":::"
-
-    -- lexer for when we are parsing from the beginning of a new line
-    -- (handles significant whitespace)
-    beginline :: [Int] -> InputState -> [Token]
-    beginline indents inputState@(str, pos@Loc{line=lineNum})
-        | (indentTokens, afterIndentState, newIndents) <- eatIndentations indents inputState
-        = indentTokens ++ scan newIndents afterIndentState
-
-    theTokens = beginline [0] (dropWhileEnd isSpace input, Loc 1 0)
-
+    result = case run (newline' >> scan <* end) initState of
+      Left err@(_, state) -> error $ showError input err (position state)
+      Right (toks, _) -> toks
